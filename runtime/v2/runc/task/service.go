@@ -72,14 +72,15 @@ func NewTaskService(ctx context.Context, publisher shim.Publisher, sd shutdown.S
 	}
 	go ep.Run(ctx)
 	s := &service{
-		context:         ctx,
-		events:          make(chan interface{}, 128),
-		ec:              reaper.Default.Subscribe(),
-		ep:              ep,
-		shutdown:        sd,
-		containers:      make(map[string]*runc.Container),
-		running:         make(map[int][]containerProcess),
-		exitSubscribers: make(map[*map[int][]runcC.Exit]struct{}),
+		context:               ctx,
+		events:                make(chan interface{}, 128),
+		ec:                    reaper.Default.Subscribe(),
+		ep:                    ep,
+		shutdown:              sd,
+		containers:            make(map[string]*runc.Container),
+		running:               make(map[int][]containerProcess),
+		exitSubscribers:       make(map[*map[int][]runcC.Exit]struct{}),
+		pendingExecsByInitPid: make(map[int]*sync.WaitGroup),
 	}
 	go s.processExits()
 	runcC.Monitor = reaper.Default
@@ -119,6 +120,9 @@ type service struct {
 	// lifecycleMu.
 	exitSubscribers map[*map[int][]runcC.Exit]struct{}
 
+	pendingExecsByInitPidLock sync.Mutex
+	pendingExecsByInitPid     map[int]*sync.WaitGroup
+
 	shutdown shutdown.Service
 }
 
@@ -129,8 +133,13 @@ type containerProcess struct {
 
 // preStart prepares for starting a container process and handling its exit.
 // The container being started should be passed in as c when starting the
-// container init process for an already-created container. c should be nil when
-// creating a container or when starting an exec.
+// container init process for an already-created container, or when starting
+// an exec. c should be nil only when creating a container.
+//
+// preStart ensures that event order is preserved between exec'd process exits
+// and the init process exit (exec process exits are emitted before the init
+// process's) by adding to `s.pendingExecsByInitPid[c.Pid()]`'s waitgroup when
+// preStart is called and calling `Done` when handleStarted is called
 //
 // The returned handleStarted closure records that the process has started so
 // that its exit can be handled efficiently. If the process has already exited,
@@ -140,14 +149,23 @@ type containerProcess struct {
 // The returned cleanup closure releases resources used to handle early exits.
 // It must be called before the caller of preStart returns, otherwise severe
 // memory leaks will occur.
-func (s *service) preStart(c *runc.Container) (handleStarted func(*runc.Container, process.Process), cleanup func()) {
+func (s *service) preStart(c *runc.Container, execID string) (handleStarted func(*runc.Container, process.Process), cleanup func()) {
 	exits := make(map[int][]runcC.Exit)
 
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	s.exitSubscribers[&exits] = struct{}{}
 
-	if c != nil {
+	if execID != "" {
+		s.pendingExecsByInitPidLock.Lock()
+		if _, ok := s.pendingExecsByInitPid[c.Pid()]; !ok {
+			s.pendingExecsByInitPid[c.Pid()] = &sync.WaitGroup{}
+		}
+		s.pendingExecsByInitPid[c.Pid()].Add(1)
+		s.pendingExecsByInitPidLock.Unlock()
+	}
+
+	if execID == "" && c != nil {
 		// Remove container init process from s.running so it will once again be
 		// treated as an early exit if it exits before handleStarted is called.
 		pid := c.Pid()
@@ -181,6 +199,11 @@ func (s *service) preStart(c *runc.Container) (handleStarted func(*runc.Containe
 			for _, ee := range ees {
 				s.handleProcessExit(ee, c, p)
 			}
+			s.pendingExecsByInitPidLock.Lock()
+			if wg, ok := s.pendingExecsByInitPid[c.Pid()]; ok {
+				wg.Done()
+			}
+			s.pendingExecsByInitPidLock.Unlock()
 		} else {
 			s.running[pid] = append(s.running[pid], containerProcess{
 				Container: c,
@@ -206,7 +229,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	handleStarted, cleanup := s.preStart(nil)
+	handleStarted, cleanup := s.preStart(nil, "")
 	defer cleanup()
 
 	container, err := runc.NewContainer(ctx, s.platform, r)
@@ -253,11 +276,7 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 		return nil, err
 	}
 
-	var cinit *runc.Container
-	if r.ExecID == "" {
-		cinit = container
-	}
-	handleStarted, cleanup := s.preStart(cinit)
+	handleStarted, cleanup := s.preStart(container, r.ExecID)
 	defer cleanup()
 	p, err := container.Start(ctx, r)
 	if err != nil {
@@ -630,6 +649,23 @@ func (s *service) processExits() {
 		s.lifecycleMu.Unlock()
 
 		for _, cp := range cps {
+			s.pendingExecsByInitPidLock.Lock()
+			wg, ok := s.pendingExecsByInitPid[cp.Process.Pid()]
+			s.pendingExecsByInitPidLock.Unlock()
+			if ok {
+				// I am the init process so lets make sure we handle
+				// any pending execs before processing my exit
+				go func() {
+					wg.Wait()
+					s.handleProcessExit(e, cp.Container, cp.Process)
+					// init process has exited, lets not leak memory
+					// and remove our waitgroup
+					s.pendingExecsByInitPidLock.Lock()
+					delete(s.pendingExecsByInitPid, cp.Process.Pid())
+					s.pendingExecsByInitPidLock.Unlock()
+				}()
+				continue
+			}
 			s.handleProcessExit(e, cp.Container, cp.Process)
 		}
 	}
