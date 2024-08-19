@@ -310,12 +310,12 @@ func run(ctx context.Context, manager Manager, config Config) error {
 		return nil
 	}
 
-	if !config.NoSetupLogger {
-		ctx, err = setLogger(ctx, id)
-		if err != nil {
-			return err
-		}
+	// if !config.NoSetupLogger {
+	ctx, err = setLogger(ctx, id)
+	if err != nil {
+		return err
 	}
+	// }
 
 	registry.Register(&plugin.Registration{
 		Type: plugins.InternalPlugin,
